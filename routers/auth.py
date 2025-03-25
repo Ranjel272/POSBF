@@ -1,0 +1,155 @@
+from fastapi import Depends, APIRouter, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import aioodbc
+import asyncio
+from database import get_db_connection  # ✅ Corrected database import
+
+# JWT Configuration
+SECRET_KEY = "15882913506880857248f72d1dbc38dd7d2f8f352786563ef5f23dc60987c632"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+router = APIRouter()
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: str or None = None
+
+class User(BaseModel):
+    username: str
+    userRole: str
+    disabled: bool or None = None
+
+class UserInDB(User):
+    hashed_password: str
+
+# Set password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+
+async def get_user_from_db(username: str):
+    """Fetch user details from database."""
+    conn = await get_db_connection()
+    cursor = await conn.cursor()
+    await cursor.execute('''SELECT Username, UserPassword, UserRole, isDisabled 
+                            FROM Users WHERE Username = ?''', (username,))
+    user_row = await cursor.fetchone()
+    await conn.close()
+    
+    if user_row:
+        return UserInDB(
+            username=user_row[0],
+            hashed_password=user_row[1],
+            userRole=user_row[2],
+            disabled=user_row[3] == 1
+        )
+    return None
+
+# Hash password
+def get_password_hash(password: str):
+    return pwd_context.hash(password)
+
+# Ensure admin account exists on startup
+async def create_admin_user():
+    admin_user = await get_user_from_db('admin')
+    if not admin_user:
+        hashed_password = get_password_hash('admin123')
+        conn = await get_db_connection()
+        cursor = await conn.cursor()
+        try:
+            await cursor.execute('''
+                INSERT INTO Users (FullName, Username, UserPassword, UserRole, isDisabled) 
+                VALUES (?, ?, ?, ?, ?)
+            ''', ('Admin User', 'admin', hashed_password, 'admin', 0))
+            await conn.commit()
+        finally:
+            await cursor.close()
+            await conn.close()
+
+# Call function on startup
+@router.on_event("startup")
+async def on_startup():
+    await create_admin_user()
+
+# Verify password
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+# Authenticate user
+async def authenticate_user(username: str, password: str):
+    user = await get_user_from_db(username)
+    if not user or not verify_password(password, user.hashed_password):
+        return None
+    return user
+
+# Create JWT token
+def create_access_token(data: dict, expires_delta: timedelta or None = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta if expires_delta else timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# Get current user from JWT token
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credential_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"}
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credential_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credential_exception
+
+    user = await get_user_from_db(token_data.username)
+    if user is None:
+        raise credential_exception
+
+    return user
+
+# Get current active user
+async def get_current_active_user(current_user: UserInDB = Depends(get_current_user)):
+    if current_user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+# Role-based restrictions
+def role_required(required_roles: list[str]):
+    async def role_checker(current_user: UserInDB = Depends(get_current_active_user)):
+        if current_user.userRole not in required_roles:
+            raise HTTPException(status_code=403, detail="Access denied")
+        return current_user
+    return role_checker
+
+# Authenticate user and return JWT token
+@router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = await authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Incorrect username or password", 
+                            headers={"WWW-Authenticate": "Bearer"})
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username, "role": user.userRole}, expires_delta=access_token_expires)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Fetch current user's details
+@router.get("/users/me/", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
+# Example: Admin-only route
+@router.get("/admin-only-route", dependencies=[Depends(role_required(["admin"]))])
+async def admin_only_route():
+    return {"message": "This is restricted to admins only"}
