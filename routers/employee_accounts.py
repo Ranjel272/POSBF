@@ -1,53 +1,75 @@
 from fastapi import APIRouter, HTTPException, Depends, status, Form
 from datetime import datetime
 from database import get_db_connection
-from routers.auth import get_current_active_user, role_required, get_password_hash
+from routers.auth import get_current_active_user, role_required
+import bcrypt
 
 router = APIRouter()
 
-# 🟢 Admin: Create a new employee account
 @router.post('/create', dependencies=[Depends(role_required(["admin"]))])
 async def create_user(
     fullName: str = Form(...),
-    username: str | None = Form(None),  # Cashiers may not have usernames
-    password: str | None = Form(None),  # Admin/Managers use passwords
-    passcode: str | None = Form(None),  # Cashiers use passcodes
-    userRole: str = Form(...)
+    username: str = Form(None),
+    password: str = Form(...),
+    userRole: str = Form(...),
+    current_user=Depends(get_current_active_user)
 ):
     if userRole not in ['admin', 'manager', 'cashier']:
         raise HTTPException(status_code=400, detail="Invalid role")
-    
-    if userRole == 'cashier' and not passcode:
-        raise HTTPException(status_code=400, detail="Cashiers require a passcode")
-    
-    if userRole in ['admin', 'manager'] and not password:
-        raise HTTPException(status_code=400, detail="Admins & Managers require a password")
 
-    hashed_password = get_password_hash(password) if password else None
-    hashed_passcode = get_password_hash(passcode) if passcode else None
+    if not password.strip():
+        raise HTTPException(status_code=400, detail="Password is required")
 
     conn = await get_db_connection()
     cursor = await conn.cursor()
 
+    # Check if FullName already exists for any role
+    await cursor.execute("SELECT 1 FROM Users WHERE FullName = ? AND isDisabled = 0", (fullName,))
+    if await cursor.fetchone():
+        raise HTTPException(status_code=400, detail="Full name is already used")
+
+    if userRole == 'cashier':
+        username = "cashier"
+
+        # Check if the password is already used by another active cashier
+        await cursor.execute('''
+            SELECT UserPassword FROM Users WHERE UserRole = 'cashier' AND isDisabled = 0
+        ''')
+        all_cashier_passwords = await cursor.fetchall()
+        for row in all_cashier_passwords:
+            if bcrypt.checkpw(password.encode('utf-8'), row[0].encode('utf-8')):
+                raise HTTPException(status_code=400, detail="This password is already used by another cashier.")
+    else:
+        if not username or not username.strip():
+            raise HTTPException(status_code=400, detail="Username is required for admin/manager roles")
+
+        # Check if the username already exists
+        await cursor.execute("SELECT 1 FROM Users WHERE Username = ? AND isDisabled = 0", (username,))
+        if await cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Username is already taken")
+
+    # Hash password
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
     try:
         await cursor.execute('''
-            INSERT INTO Users (FullName, Username, UserPassword, Passcode, UserRole)
+            INSERT INTO Users (FullName, Username, UserPassword, UserRole, CreatedAt)
             VALUES (?, ?, ?, ?, ?)
-        ''', (fullName, username, hashed_password, hashed_passcode, userRole))
+        ''', (fullName, username, hashed_password, userRole, datetime.utcnow()))
         await conn.commit()
     finally:
         await cursor.close()
         await conn.close()
 
-    return {'message': 'User created successfully!'}
+    return {'message': f'{userRole.capitalize()} created successfully!'}
 
-# 🟢 Admin: Fetch all active employee accounts
+
 @router.get('/list-employee-accounts', dependencies=[Depends(role_required(['admin']))])
 async def list_users():
     conn = await get_db_connection()
     cursor = await conn.cursor()
 
-    await cursor.execute('''
+    await cursor.execute(''' 
         SELECT UserID, FullName, Username, UserRole, CreatedAt
         FROM Users
         WHERE isDisabled = 0
@@ -58,17 +80,16 @@ async def list_users():
     return [{"userID": u[0], "fullName": u[1], "username": u[2], "userRole": u[3], "createdAt": u[4]}
             for u in users]
 
-# 🟢 Admin: Update an employee account
+
 @router.put("/update/{user_id}", dependencies=[Depends(role_required(['admin']))])
 async def update_user(
     user_id: int,
     fullName: str | None = Form(None),
-    password: str | None = Form(None),
-    passcode: str | None = Form(None)
+    password: str | None = Form(None)
 ):
     conn = await get_db_connection()
     cursor = await conn.cursor()
-    
+
     updates = []
     values = []
 
@@ -76,13 +97,9 @@ async def update_user(
         updates.append('FullName = ?')
         values.append(fullName)
     if password:
-        hashed_password = get_password_hash(password)
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         updates.append('UserPassword = ?')
         values.append(hashed_password)
-    if passcode:
-        hashed_passcode = get_password_hash(passcode)
-        updates.append('Passcode = ?')
-        values.append(hashed_passcode)
     updates.append('CreatedAt = ?')
     values.append(datetime.utcnow())
 
@@ -104,17 +121,17 @@ async def update_user(
 
     return {'message': 'No fields to update'}
 
-# 🟢 Admin: Soft-delete an employee account
+
 @router.delete('/delete/{user_id}', dependencies=[Depends(role_required(['admin']))])
 async def delete_user(user_id: int):
     conn = await get_db_connection()
     cursor = await conn.cursor()
 
     try:
-        await cursor.execute('''
+        await cursor.execute(''' 
             UPDATE Users
             SET isDisabled = 1
-            WHERE UserID = ?
+            WHERE UserID = ? 
         ''', (user_id,))
         await conn.commit()
     finally:
@@ -123,17 +140,16 @@ async def delete_user(user_id: int):
 
     return {'message': 'User deleted successfully'}
 
-# 🟢 Employee: Update their own account details
+
 @router.put('/self-update', dependencies=[Depends(role_required(['cashier', 'manager']))])
 async def update_self(
     fullName: str | None = Form(None),
     password: str | None = Form(None),
-    passcode: str | None = Form(None),
     current_user=Depends(get_current_active_user)
 ):
     conn = await get_db_connection()
     cursor = await conn.cursor()
-    
+
     updates = []
     values = []
 
@@ -141,13 +157,9 @@ async def update_self(
         updates.append("FullName = ?")
         values.append(fullName)
     if password:
-        hashed_password = get_password_hash(password)
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         updates.append("UserPassword = ?")
         values.append(hashed_password)
-    if passcode:
-        hashed_passcode = get_password_hash(passcode)
-        updates.append("Passcode = ?")
-        values.append(hashed_passcode)
     updates.append('CreatedAt = ?')
     values.append(datetime.utcnow())
 
@@ -168,3 +180,5 @@ async def update_self(
         return {'message': 'Your account details have been updated!'}
 
     return {'message': 'No fields to update'}
+
+
